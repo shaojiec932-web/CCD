@@ -1,0 +1,310 @@
+﻿#ifdef TRACKDOCK_MQTT_CLIENT_IMPLEMENTATION
+#include "trackdock_mqtt_client.h"
+#include "mcp_stm32_motor_control.h"
+#include "mcp_rfid_cargo_manager.h"
+#include "mcp_uwb_navigation.h"
+#include "mcp_serial_display.h"
+#include "mcp_storage_lid.h"
+#include "trackdock_scene.h"
+#include "application.h"
+#include "board.h"
+#include "audio_codec.h"
+#include "config.h"
+#include <driver/gpio.h>
+
+#include <cJSON.h>
+#include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <mqtt.h>
+#include <memory>
+#include <string>
+#include <cstring>
+#include <cstdio>
+
+#undef TAG
+#define TAG "TrackDockMQTT"
+
+static constexpr const char* MQTT_HOST = "od90f9ff.ala.dedicated.aliyun.emqxcloud.cn";
+static constexpr int MQTT_PORT = 8883;
+static constexpr const char* MQTT_USERNAME = "admin";
+static constexpr const char* MQTT_PASSWORD = "1234";
+static constexpr const char* MQTT_PREFIX = "trackdock/device001";
+
+static std::unique_ptr<Mqtt> mqtt_client;
+static bool mqtt_connected = false;
+static bool client_started = false;
+static bool rfid_scan_active = false;
+
+static const char* RfidDisplayText(const std::string& cargo_json) {
+    if (cargo_json.find("已识别") != std::string::npos ||
+        cargo_json.find("扫描成功") != std::string::npos) {
+        return "RFID scan success";
+    }
+    if (cargo_json.find("已存在") != std::string::npos) {
+        return "RFID already scanned";
+    }
+    if (cargo_json.find("未检测到") != std::string::npos) {
+        return "RFID no tag";
+    }
+    return "RFID scanning...";
+}
+static std::string Topic(const char* suffix) {
+    return std::string(MQTT_PREFIX) + "/" + suffix;
+}
+
+static bool PublishRaw(const char* suffix, const std::string& payload) {
+    if (!mqtt_client || !mqtt_connected) {
+        ESP_LOGW(TAG, "Drop publish %s, MQTT not connected", suffix);
+        return false;
+    }
+    return mqtt_client->Publish(Topic(suffix), payload, 0);
+}
+
+static std::string JsonText(const char* key, const char* text) {
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, key, text ? text : "");
+    char* raw = cJSON_PrintUnformatted(root);
+    std::string out = raw ? raw : "{}";
+    if (raw) cJSON_free(raw);
+    cJSON_Delete(root);
+    return out;
+}
+
+void TrackDockMqtt_PublishState() {
+    bool smoke_alarm =
+        gpio_get_level(SMOKE_SENSOR_1_GPIO) == SMOKE_SENSOR_ACTIVE_LEVEL ||
+        gpio_get_level(SMOKE_SENSOR_2_GPIO) == SMOKE_SENSOR_ACTIVE_LEVEL;
+
+    char json[448];
+    snprintf(json, sizeof(json),
+             "{\"motor\":{\"state\":\"%s\",\"speed\":%d},\"scene\":{\"id\":\"%s\",\"name\":\"%s\"},\"safety\":{\"smoke_alarm\":%s},\"storage_lid\":{\"state\":\"%s\"}}",
+             Stm32MotorIsRunning() ? "running" : "idle",
+             Stm32MotorGetSpeed(),
+             TrackDockScene_GetId(),
+             TrackDockScene_GetName(),
+             smoke_alarm ? "true" : "false",
+             StorageLidStateText());
+    PublishRaw("state", json);
+}
+
+void TrackDockMqtt_PublishTelemetry() {
+    PublishRaw("telemetry", UwbNavigationGetTelemetryJson());
+}
+
+void TrackDockMqtt_PublishCargoJson(const std::string& cargo_json) {
+    PublishRaw("cargo", cargo_json);
+}
+
+void TrackDockMqtt_PublishDialog(const char* text) {
+    PublishRaw("dialog", JsonText("text", text));
+}
+
+void TrackDockMqtt_PublishEvent(const char* text) {
+    PublishRaw("event", JsonText("text", text));
+}
+
+static void RfidScanTask(void* arg) {
+    while (rfid_scan_active) {
+        std::string cargo = RfidCargoScanOnce();
+        TrackDockMqtt_PublishCargoJson(cargo);
+        SerialDisplay_ShowRfidInfo(RfidDisplayText(cargo));
+        vTaskDelay(pdMS_TO_TICKS(1500));
+    }
+    vTaskDelete(NULL);
+}
+
+static void StartRfidScan(const std::string& target_name = "") {
+    std::string msg = RfidCargoStartCollecting(target_name);
+    TrackDockMqtt_PublishCargoJson(msg);
+    SerialDisplay_ShowRfidInfo("RFID scan started");
+
+    if (!rfid_scan_active) {
+        rfid_scan_active = true;
+        xTaskCreate(RfidScanTask, "trackdock_rfid", 4096, NULL, 4, NULL);
+    }
+}
+
+static void StopRfidScan() {
+    rfid_scan_active = false;
+    std::string msg = RfidCargoFinishCollecting();
+    TrackDockMqtt_PublishCargoJson(msg);
+    SerialDisplay_ShowRfidInfo("RFID scan finished");
+}
+
+static void SetAudioVolume(int value) {
+    if (value < 0) value = 0;
+    if (value > 100) value = 100;
+    auto codec = Board::GetInstance().GetAudioCodec();
+    if (codec) {
+        codec->SetOutputVolume(value);
+    }
+}
+
+static int JsonInt(cJSON* root, const char* key, int fallback) {
+    cJSON* item = cJSON_GetObjectItem(root, key);
+    return cJSON_IsNumber(item) ? item->valueint : fallback;
+}
+
+static std::string JsonString(cJSON* root, const char* key) {
+    cJSON* item = cJSON_GetObjectItem(root, key);
+    return cJSON_IsString(item) ? item->valuestring : "";
+}
+
+static void PublishCommandAck(const char* type, const char* action) {
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", type ? type : "unknown");
+    cJSON_AddStringToObject(root, "action", action ? action : "unknown");
+    cJSON_AddStringToObject(root, "status", "ok");
+    char* raw = cJSON_PrintUnformatted(root);
+    if (raw) {
+        PublishRaw("ack", raw);
+        cJSON_free(raw);
+    }
+    cJSON_Delete(root);
+}
+
+static void HandleCommand(const std::string& payload) {
+    cJSON* root = cJSON_Parse(payload.c_str());
+    if (!root) {
+        ESP_LOGW(TAG, "Invalid command payload: %s", payload.c_str());
+        return;
+    }
+
+    std::string type = JsonString(root, "type");
+    std::string action = JsonString(root, "action");
+    std::string item_name = JsonString(root, "item_name");
+    if (item_name.empty()) item_name = JsonString(root, "cargo_name");
+    if (item_name.empty()) item_name = JsonString(root, "name");
+    std::string scene = JsonString(root, "scene");
+    int value = JsonInt(root, "value", -1);
+
+    ESP_LOGI(TAG, "Command type=%s action=%s value=%d", type.c_str(), action.c_str(), value);
+
+    if (type == "motor") {
+        if (action == "forward") Stm32MotorGoForward();
+        else if (action == "back" || action == "backward") Stm32MotorBackUp();
+        else if (action == "left") Stm32MotorTurnLeft();
+        else if (action == "right") Stm32MotorTurnRight();
+        else if (action == "stop") Stm32MotorStop();
+        else if (action == "set_speed" && value >= 0) Stm32MotorSetSpeed(value);
+        TrackDockMqtt_PublishState();
+    } else if (type == "rfid") {
+        if (action == "start_scan") StartRfidScan(item_name);
+        else if (action == "stop_scan") StopRfidScan();
+    } else if (type == "uwb") {
+        if (action == "start_location") {
+            bool ok = UwbNavigationStartPositioning();
+            SerialDisplay_ShowLocationInfo(ok ? "UWB positioning started" : "UWB positioning failed");
+            TrackDockMqtt_PublishTelemetry();
+        } else if (action == "stop_location") {
+            UwbNavigationStop();
+            SerialDisplay_ShowLocationInfo("UWB positioning stopped");
+            TrackDockMqtt_PublishTelemetry();
+        }
+    } else if (type == "xiaozhi") {
+        if (action == "start") {
+            SerialDisplay_ShowDialogText("Xiaozhi: listening...");
+            Application::GetInstance().StartListening();
+            TrackDockMqtt_PublishDialog("Xiaozhi: listening...");
+        } else if (action == "stop") {
+            SerialDisplay_ShowDialogText("Xiaozhi: stopped");
+            Application::GetInstance().StopListening();
+            TrackDockMqtt_PublishDialog("Xiaozhi: stopped");
+        }
+    } else if (type == "audio") {
+        if (action == "set_volume" && value >= 0) {
+            SetAudioVolume(value);
+        }
+    } else if (type == "scene") {
+        if (action == "set") {
+            TrackDockScene_Set(scene.c_str());
+            TrackDockMqtt_PublishState();
+            char screen_message[64];
+            char message[128];
+            snprintf(screen_message, sizeof(screen_message), "Scene: %s", TrackDockScene_GetId());
+            snprintf(message, sizeof(message), "已切换到%s场景", TrackDockScene_GetName());
+            SerialDisplay_ShowDialogText(screen_message);
+            TrackDockMqtt_PublishDialog(message);
+            Application::GetInstance().Alert("Scene mode", message, "neutral");
+        }
+    } else if (type == "storage_lid") {
+        if (action == "open" || action == "set_open") {
+            StorageLidOpen(false);
+        } else if (action == "close" || action == "set_close") {
+            StorageLidClose(false);
+        } else if (action == "set_state") {
+            std::string lid_state = JsonString(root, "state");
+            if (lid_state == "open") StorageLidOpen(false);
+            else if (lid_state == "close" || lid_state == "closed") StorageLidClose(false);
+        }
+    }
+
+    PublishCommandAck(type.c_str(), action.c_str());
+    cJSON_Delete(root);
+}
+
+static void TrackDockMqttTask(void* arg) {
+    vTaskDelay(pdMS_TO_TICKS(8000));
+
+    while (true) {
+        if (!mqtt_client || !mqtt_connected) {
+            mqtt_connected = false;
+            auto network = Board::GetInstance().GetNetwork();
+            if (!network) {
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                continue;
+            }
+
+            mqtt_client = network->CreateMqtt(1);
+            mqtt_client->SetKeepAlive(60);
+            mqtt_client->OnConnected([]() {
+                mqtt_connected = true;
+                ESP_LOGI(TAG, "TrackDock cloud connected");
+                mqtt_client->Subscribe(Topic("cmd"), 0);
+                TrackDockMqtt_PublishState();
+                TrackDockMqtt_PublishTelemetry();
+                TrackDockMqtt_PublishDialog("TarckDock online");
+            });
+            mqtt_client->OnDisconnected([]() {
+                mqtt_connected = false;
+                ESP_LOGW(TAG, "TrackDock cloud disconnected");
+            });
+            mqtt_client->OnMessage([](const std::string& topic, const std::string& payload) {
+                ESP_LOGI(TAG, "RX %s: %s", topic.c_str(), payload.c_str());
+                if (topic == Topic("cmd")) {
+                    HandleCommand(payload);
+                }
+            });
+            mqtt_client->OnError([](const std::string& error) {
+                ESP_LOGW(TAG, "TrackDock cloud error: %s", error.c_str());
+            });
+
+            std::string client_id = std::string("trackdock-esp32-") + Board::GetInstance().GetUuid();
+            ESP_LOGI(TAG, "Connecting TrackDock cloud: %s:%d", MQTT_HOST, MQTT_PORT);
+            if (!mqtt_client->Connect(MQTT_HOST, MQTT_PORT, client_id, MQTT_USERNAME, MQTT_PASSWORD)) {
+                ESP_LOGW(TAG, "TrackDock cloud connect failed, retry later");
+                mqtt_client.reset();
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                continue;
+            }
+        }
+
+        TrackDockMqtt_PublishState();
+        TrackDockMqtt_PublishTelemetry();
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+void InitTrackDockMqttClient() {
+    if (client_started) return;
+    client_started = true;
+    xTaskCreate(TrackDockMqttTask, "trackdock_mqtt", 8192, NULL, 4, NULL);
+    ESP_LOGI(TAG, "TrackDock MQTT client task started");
+}
+#endif // TRACKDOCK_MQTT_CLIENT_IMPLEMENTATION
+
+
+
+
+
